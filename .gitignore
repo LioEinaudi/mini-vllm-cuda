@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+
+.venv/
+
+build/
+dist/
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.agents/
+.codex/
+
+data/
+models/
+checkpoints/
+results/
+
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Local learning / agent workflow notes. Keep them locally, do not publish.
+AGENTS.md
+LEARNING_GUIDE.md
+TASKS.md
+
+# Only publish public build notes from docs for the initial GitHub push.
+docs/*
+!docs/
+!docs/build_notes.md
