@@ -77,7 +77,83 @@ __global__ void rmsnorm_v0_naive_kernel(
   }
 }
 
-torch::Tensor rmsnorm_cuda(torch::Tensor x, torch::Tensor weight, double eps) {
+__device__ __forceinline__ float warp_reduce_sum(float value)
+{
+  unsigned int mask = 0xffffffffu;
+  value += __shfl_down_sync(mask, value, 16);
+  value += __shfl_down_sync(mask, value, 8);
+  value += __shfl_down_sync(mask, value, 4);
+  value += __shfl_down_sync(mask, value, 2);
+  value += __shfl_down_sync(mask, value, 1);
+  return value;
+}
+
+/*
+RMSNorm v1 warp-reduce CUDA kernel
+
+This kernel keeps the same public behavior and row/block mapping as v0:
+one CUDA block handles one token row and accumulation stays in fp32.
+
+The optimization is only in the row reduction:
+  - each warp reduces its thread-local partial sums with __shfl_down_sync
+  - each warp writes one warp sum to shared memory
+  - warp 0 reduces those per-warp sums into the final row sum
+
+Compared with v0, this reduces shared-memory reduction traffic and the number
+of block-wide synchronizations. It still reads x twice, so memory dependency
+and long scoreboard stalls can remain important for larger rows.
+*/
+template<typename scalar_t>
+    __global__ void rmsnorm_v1_kernel(
+        const scalar_t *x,
+        const scalar_t *weight,
+        scalar_t *y,
+        int hidden_size,
+        float eps)
+{
+  extern __shared__ float shared[];
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  int row_offset = row * hidden_size;
+
+  float thread_sum = 0.0f;
+
+  for (int col = tid; col < hidden_size; col += blockDim.x)
+  {
+    float v = static_cast<float>(x[row_offset + col]);
+    thread_sum += v * v;
+  }
+
+  int lane_id = tid & 31;
+  int warp_id = tid >> 5;
+  int num_warps = blockDim.x / 32;
+  float warp_sum = warp_reduce_sum(thread_sum);
+  if ( lane_id == 0 ) {
+    shared[warp_id] = warp_sum;
+  }
+  __syncthreads();
+  float block_sum = 0.0f;
+  if ( warp_id == 0 ) {
+    block_sum = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+    block_sum = warp_reduce_sum(block_sum);
+    if ( lane_id == 0 ) {
+      shared[0] = rsqrtf(block_sum / static_cast<float>(hidden_size) + eps);
+
+    }
+  }
+  __syncthreads();
+  float inv_rms = shared[0];
+
+  for (int col = tid; col < hidden_size; col += blockDim.x)
+  {
+    float v = static_cast<float>(x[col + row_offset]);
+    float w = static_cast<float>(weight[col]);
+    float out = v * inv_rms * w;
+    y[col + row_offset] = static_cast<scalar_t>(out);
+  }
+}
+
+torch::Tensor rmsnorm_launch(torch::Tensor x, torch::Tensor weight, double eps, bool use_v1) {
   MVC_CHECK_CUDA(x);
   MVC_CHECK_CUDA(weight);
   TORCH_CHECK (x.dim() == 2, "x must have shape [num_tokens, hidden_size]");
@@ -102,16 +178,34 @@ torch::Tensor rmsnorm_cuda(torch::Tensor x, torch::Tensor weight, double eps) {
   const dim3 grid = (static_cast<unsigned int >(num_tokens));
   size_t shared_bytes = threads * sizeof(float);
   auto stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(x_contig.scalar_type(),"rmsnorm_v0_naive_kernel",[&]{
-    rmsnorm_v0_naive_kernel<scalar_t> <<< grid , block,shared_bytes,stream>>>(
-      x_contig.data_ptr <scalar_t>() ,
-      weight_contig.data_ptr < scalar_t>() , 
-      y.data_ptr < scalar_t>() , 
-      static_cast< int> ( hidden_size ) , 
-      static_cast < float >(eps)
-    );
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(x_contig.scalar_type(),"rmsnorm_kernel",[&]{
+    if (use_v1) {
+      rmsnorm_v1_kernel<scalar_t> <<< grid , block,shared_bytes,stream>>>(
+        x_contig.data_ptr <scalar_t>() ,
+        weight_contig.data_ptr < scalar_t>() ,
+        y.data_ptr < scalar_t>() ,
+        static_cast< int> ( hidden_size ) ,
+        static_cast < float >(eps)
+      );
+    } else {
+      rmsnorm_v0_naive_kernel<scalar_t> <<< grid , block,shared_bytes,stream>>>(
+        x_contig.data_ptr <scalar_t>() ,
+        weight_contig.data_ptr < scalar_t>() ,
+        y.data_ptr < scalar_t>() ,
+        static_cast< int> ( hidden_size ) ,
+        static_cast < float >(eps)
+      );
+    }
   });
   
   C10_CUDA_KERNEL_LAUNCH_CHECK(); 
   return y; 
+}
+
+torch::Tensor rmsnorm_cuda(torch::Tensor x, torch::Tensor weight, double eps) {
+  return rmsnorm_launch(x, weight, eps, false);
+}
+
+torch::Tensor rmsnorm_v1_cuda(torch::Tensor x, torch::Tensor weight, double eps) {
+  return rmsnorm_launch(x, weight, eps, true);
 }

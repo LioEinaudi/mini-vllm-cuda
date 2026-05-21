@@ -6,20 +6,21 @@ The project currently focuses on operator-level implementations rather than a co
 
 ## Implemented So Far
 
-- RMSNorm v0 CUDA kernel in `csrc/rmsnorm.cu`.
+- RMSNorm v0 naive CUDA kernel in `csrc/rmsnorm.cu`.
+- RMSNorm v1 warp-reduce CUDA kernel in `csrc/rmsnorm.cu`.
 - PyTorch reference implementations in `mini_vllm_cuda/torch_ref.py`.
 - PyTorch C++/CUDA extension binding through `csrc/bindings.cpp`.
 - dtype dispatch for RMSNorm float32 and float16 inputs.
-- pytest correctness tests for RMSNorm float32 and float16.
-- RMSNorm latency benchmark with median and p95 timing.
+- pytest correctness tests for RMSNorm v0/v1 with float32 and float16.
+- RMSNorm latency benchmark with median and p95 timing, including v0/v1 comparison.
 - Build and environment notes in `docs/build_notes.md`.
-- RMSNorm benchmark methodology and interpretation are maintained in local learning notes; public Nsight profiling notes are planned.
+- RMSNorm benchmark methodology and Nsight profiling interpretation are maintained in local learning notes; raw profiling reports are kept out of Git.
 
 RoPE, decode attention, and INT8 GEMV currently remain placeholder/scaffold implementations.
 
-## RMSNorm v0
+## RMSNorm v0 and v1
 
-RMSNorm v0 is the first hand-written CUDA kernel in this repository.
+RMSNorm v0 is the first hand-written CUDA kernel in this repository. RMSNorm v1 keeps the same row-level mapping and replaces the full shared-memory tree reduction with a warp-level reduction.
 
 Input and output:
 
@@ -35,7 +36,7 @@ Formula:
 y = x * rsqrt(mean(x^2) + eps) * weight
 ```
 
-Kernel mapping:
+v0 kernel mapping:
 
 - one CUDA block handles one token row
 - each thread processes columns with a strided loop
@@ -43,13 +44,25 @@ Kernel mapping:
 - dynamic shared memory performs a tree reduction to compute the row sum
 - each thread makes a second pass over the row and writes normalized output
 
+v1 kernel change:
+
+- each warp first reduces its partial sums with `__shfl_down_sync`
+- one value per warp is written to shared memory
+- warp 0 reduces the per-warp sums to compute the row sum
+- this reduces block-level synchronization compared with v0
+
+Profiling notes:
+
+- Nsight Systems shows the PyTorch reference decomposes RMSNorm into multiple ATen kernels.
+- The custom RMSNorm path appears as a dedicated CUDA kernel.
+- Nsight Compute indicates long scoreboard / memory dependency can still limit further speedup, so v1 is a reduction optimization rather than a final memory-traffic optimization.
+
 Current limitations:
 
-- no warp-level reduction yet
 - no vectorized load/store path yet
 - no `half2` path yet
 - block size is fixed at 256 threads
-- input `x` is read twice in the v0 implementation
+- input `x` is still read twice
 
 ## Correctness and Benchmarking
 
@@ -66,7 +79,7 @@ pytest tests/
 Run the RMSNorm benchmark:
 
 ```bash
-python benchmarks/bench_rmsnorm.py
+python benchmarks/bench_rmsnorm.py --impl all
 ```
 
 The benchmark output includes:
@@ -141,6 +154,7 @@ bash scripts/bench.sh
 import mini_vllm_cuda as mvc
 
 y = mvc.rmsnorm(x, weight, eps)
+y_v1 = mvc.rmsnorm_v1(x, weight, eps)
 q_out, k_out = mvc.rope(q, k, cos, sin)
 out = mvc.decode_attention(q, k_cache, v_cache, seq_len)
 y = mvc.int8_gemv(x, w_int8, scales)
@@ -187,7 +201,7 @@ mini-vllm-cuda/
 
 Planned kernels and tools:
 
-- RMSNorm v1 optimization based on the v0 baseline
+- RMSNorm v2 vectorized or `half2` exploration
 - RoPE CUDA kernel
 - decode attention with continuous KV cache
 - simplified paged KV cache

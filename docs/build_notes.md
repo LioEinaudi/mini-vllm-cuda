@@ -374,6 +374,71 @@ mini_vllm_cuda/ops.py
 
 PyTorch extension 的 Python 包入口里，先 `import torch` 再加载自定义 `.so`，可以避免很多动态库路径问题。
 
+## 问题 11：为什么 Nsight profiling 结果不提交到 Git
+
+### 现象
+
+RMSNorm v0 profiling 会生成这些文件：
+
+```text
+results/nsys_rmsnorm_v0.nsys-rep
+results/nsys_rmsnorm_v0.sqlite
+results/ncu_rmsnorm_v0.ncu-rep
+results/*.html
+```
+
+这些文件对本机分析很有用，但不适合直接提交到 GitHub。
+
+### 原因
+
+1. Nsight 报告通常很大。
+   例如 `.ncu-rep` 很容易达到几十 MB，后续多 profile 几次会快速膨胀仓库体积。
+
+2. Nsight 报告是机器相关的。
+   里面包含 GPU 型号、驱动、CUDA 版本、进程信息、采样细节等，本质上是一次本地实验记录。
+
+3. Git 适合保存可复现的源代码、脚本和文字结论。
+   profiling 原始产物更适合放在本地 `results/`，或者必要时放到 release/artifact，而不是跟源码一起版本化。
+
+4. 后续 benchmark/profiling 会反复生成新文件。
+   如果把 `results/` 提交进 Git，很容易造成无意义 diff。
+
+### 当前做法
+
+`.gitignore` 已经忽略：
+
+```text
+results/
+*.nsys-rep
+*.qdrep
+*.sqlite
+```
+
+推荐保存到 Git 的内容是：
+
+```text
+README.md                 # 项目状态和复现命令
+docs/build_notes.md        # 环境和构建排雷
+LEARNING_GUIDE.md          # 本地学习笔记，不对外发布
+TASKS.md                   # 本地任务进度，不对外发布
+```
+
+如果 profiling 结论值得公开，应该把它整理成文字，例如：
+
+```text
+Nsight Systems shows that PyTorch reference launches multiple ATen kernels,
+while custom RMSNorm v0 appears as one dedicated kernel.
+
+Nsight Compute on a num_tokens=1 launch shows tiny-grid underutilization:
+grid=1, block=256, Waves Per SM about 0.01.
+```
+
+也就是说：
+
+```text
+提交结论，不提交大体积原始报告。
+```
+
 ## 最终可用安装流程
 
 从项目根目录执行：

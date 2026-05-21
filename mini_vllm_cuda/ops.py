@@ -33,6 +33,10 @@ def rmsnorm(x, weight, eps=1e-6):
     return _require_extension().rmsnorm(x, weight, float(eps))
 
 
+def rmsnorm_v1(x, weight, eps=1e-6):
+    return _require_extension().rmsnorm_v1(x, weight, float(eps))
+
+
 def rope(q, k, cos, sin):
     return tuple(_require_extension().rope(q, k, cos, sin))
 
